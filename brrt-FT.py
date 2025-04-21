@@ -110,17 +110,29 @@ class BERTClassifier(nn.Module):
         return self.output(self.hidden(encoded_X[:, 0, :]))
 
 net = BERTClassifier(bert)
-lr, num_epochs = 1e-4, 30
-trainer = torch.optim.Adam(net.parameters(), lr=lr)
+lr, num_epochs = 5e-5, 15  # 降低学习率并减少训练轮数
+weight_decay = 5e-2  # 增加权重衰减以减轻过拟合
+trainer = torch.optim.Adam(net.parameters(), lr=lr, weight_decay=weight_decay)
 loss = nn.CrossEntropyLoss(reduction='none')
+# 改进学习率调度器策略
+scheduler = lr_scheduler.ReduceLROnPlateau(trainer, mode='max', factor=0.5, patience=1, verbose=True, threshold=0.005)
 
-# 自定义训练函数，添加进度条和可视化功能
-def train_with_progress_bar(net, train_iter, test_iter, loss, trainer, num_epochs, devices):
+# 自定义训练函数，添加进度条、可视化功能和早停机制
+def train_with_progress_bar(net, train_iter, test_iter, loss, trainer, num_epochs, devices, patience=5):
     timer = d2l.Timer()
     history = {'train_loss': [], 'train_acc': [], 'test_acc': []}
     
+    # 早停机制参数
+    best_test_acc = 0
+    no_improve_epochs = 0
+    
     # 将模型放到设备上
     net = nn.DataParallel(net, device_ids=devices).to(devices[0])
+    
+    # 增加dropout以减轻过拟合
+    for module in net.modules():
+        if isinstance(module, nn.Dropout):
+            module.p = 0.3  # 增加dropout值
     
     for epoch in range(num_epochs):
         # 4个维度：储存训练损失，训练准确度，实例数，特点数
@@ -160,9 +172,30 @@ def train_with_progress_bar(net, train_iter, test_iter, loss, trainer, num_epoch
         history['train_acc'].append(train_acc)
         history['test_acc'].append(test_acc)
         
+        # 更新学习率调度器
+        scheduler.step(test_acc)
+        
+        # 改进早停机制，考虑训练和测试准确率的差距
+        if test_acc > best_test_acc:
+            best_test_acc = test_acc
+            no_improve_epochs = 0
+            # 保存最佳模型
+            torch.save(net.module.state_dict(), 'best_bert_model.pt')
+            print(f'Saved best model with test accuracy: {test_acc:.4f}')
+        else:
+            no_improve_epochs += 1
+            # 检查过拟合情况
+            overfitting_gap = train_acc - test_acc
+            if overfitting_gap > 0.1 and epoch > 5:
+                print(f'Potential overfitting detected: train_acc={train_acc:.4f}, test_acc={test_acc:.4f}, gap={overfitting_gap:.4f}')
+            
+            if no_improve_epochs >= patience:
+                print(f'Early stopping at epoch {epoch+1} as no improvement for {patience} epochs')
+                break
+        
         # 打印当前epoch的结果
         print(f'Epoch {epoch+1}/{num_epochs}, loss {train_loss:.3f}, '
-              f'train acc {train_acc:.3f}, test acc {test_acc:.3f}')
+              f'train acc {train_acc:.3f}, test acc {test_acc:.3f}, lr {trainer.param_groups[0]["lr"]:.6f}')
     
     # 打印总体结果
     print(f'Loss {history["train_loss"][-1]:.3f}, train acc '
@@ -173,9 +206,13 @@ def train_with_progress_bar(net, train_iter, test_iter, loss, trainer, num_epoch
     # 绘制训练过程图表
     plt.figure(figsize=(12, 4))
     
+    # 修复绘图函数中的维度不匹配问题
+    epochs_completed = len(history['train_loss'])
+    epochs_range = range(1, epochs_completed + 1)
+    
     # 绘制损失曲线
     plt.subplot(1, 2, 1)
-    plt.plot(range(1, num_epochs+1), history['train_loss'], label='Train Loss')
+    plt.plot(epochs_range, history['train_loss'], label='Train Loss')
     plt.xlabel('Epoch')
     plt.ylabel('Loss')
     plt.title('Training Loss')
@@ -183,8 +220,8 @@ def train_with_progress_bar(net, train_iter, test_iter, loss, trainer, num_epoch
     
     # 绘制准确率曲线
     plt.subplot(1, 2, 2)
-    plt.plot(range(1, num_epochs+1), history['train_acc'], label='Train Acc')
-    plt.plot(range(1, num_epochs+1), history['test_acc'], label='Test Acc')
+    plt.plot(epochs_range, history['train_acc'], label='Train Acc')
+    plt.plot(epochs_range, history['test_acc'], label='Test Acc')
     plt.xlabel('Epoch')
     plt.ylabel('Accuracy')
     plt.title('Training and Testing Accuracy')
@@ -195,4 +232,4 @@ def train_with_progress_bar(net, train_iter, test_iter, loss, trainer, num_epoch
     plt.show()
 
 # 使用自定义训练函数替代原来的训练函数
-train_with_progress_bar(net, train_iter, test_iter, loss, trainer, num_epochs, devices)
+train_with_progress_bar(net, train_iter, test_iter, loss, trainer, num_epochs, devices, patience=5)
